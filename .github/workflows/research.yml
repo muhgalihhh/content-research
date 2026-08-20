@@ -1,0 +1,37 @@
+name: daily-content-research
+
+on:
+  schedule:
+    - cron: '0 23 * * *' # 06:00 WIB (Actions pakai UTC, WIB = UTC+7)
+  workflow_dispatch: # tombol trigger manual buat testing
+
+concurrency:
+  group: daily-content-research
+  cancel-in-progress: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Run agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python agent.py
+      - name: Commit output
+        run: |
+          git config user.name "content-bot"
+          git config user.email "bot@xharp.dev"
+          git add research/
+          git commit -m "chore: riset harian $(date +%F)" || echo "no changes"
+          git push
