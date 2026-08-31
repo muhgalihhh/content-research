@@ -3,11 +3,18 @@ from google import genai
 from google.genai import types
 from sources import fetch_rss, fetch_github_trending
 
-IDEAS_PER_DAY = 4
+MIN_IDEAS_PER_PILLAR = 1
+MAX_IDEAS_PER_PILLAR = 3
+
+# format konten -> keterangan kegunaannya (ditampilin di samping judul tiap ide)
+FORMATS = {
+    "Feed": "carousel evergreen, tersimpan di grid & gampang ditemukan lewat search/profil",
+    "Story": "konten cepat & spontan, cocok quick tips/teaser, otomatis hilang dalam 24 jam",
+}
 
 # pillar -> (deskripsi, rasio target %, tujuan, ada data sumber asli?)
 PILLARS = {
-    "Tech & Tutorial": ("Tips coding, insight teknis, mini-tutorial (Laravel, Next.js, FastAPI).", 25, "Bangun kredibilitas teknis", True),
+    "Tech & Tutorial": ("Tips & trik praktis buat developer sehari-hari, rekomendasi tools/website & AI assistant kekinian yang beneran berguna, produktivitas & soft skill kerja dev. Mini-tutorial framework (Laravel, Next.js, FastAPI) boleh sesekali tapi bukan mayoritas.", 25, "Bangun kredibilitas teknis", True),
     "Design & UI/UX": ("Proses desain, breakdown UI, tips Figma, before/after.", 25, "Tunjukin skill desain", True),
     "Case Study & Portfolio": ("Showcase project, hasil kerja, cerita di balik project.", 25, "Konversi ke klien", False),
     "IT & Tech Industry": ("Berita/tren industri IT non-teknis -- bisnis software, AI di dunia kerja, produk/startup, arah industri.", 25, "Relevansi & insight industri", True),
@@ -16,7 +23,7 @@ PILLARS = {
 PILLAR_NAMES = list(PILLARS.keys())
 PLACEHOLDER_PILLARS = {name for name, meta in PILLARS.items() if not meta[3]}
 
-REQUIRED_FIELDS = ("pillar", "hook", "angle", "outline", "source")
+REQUIRED_FIELDS = ("pillar", "format", "hook", "angle", "outline", "source")
 
 RESPONSE_SCHEMA = {
     "type": "array",
@@ -25,6 +32,7 @@ RESPONSE_SCHEMA = {
         "type": "object",
         "properties": {
             "pillar": {"type": "string", "enum": PILLAR_NAMES},
+            "format": {"type": "string", "enum": list(FORMATS.keys())},
             "hook": {"type": "string"},
             "angle": {"type": "string"},
             "outline": {
@@ -58,12 +66,20 @@ def _pillar_prompt_block():
         if name == "Hari Besar":
             note = ("HANYA pilih pillar ini kalau ada hari besar/perayaan nasional atau internasional yang jatuh "
                     "dalam 1-3 hari dari tanggal hari ini. Kalau tidak ada, JANGAN pakai pillar ini sama sekali.")
+        elif name == "Tech & Tutorial":
+            note += (" Prioritaskan bahasa yang gampang dicerna, jangan jargon-heavy atau deep-dive kode yang "
+                      "cuma dimengerti senior dev -- fokus ke value praktis (tips, tools, produktivitas). "
+                      "Mini-tutorial kode spesifik boleh muncul sesekali tapi jangan jadi mayoritas ide di pillar ini.")
         lines.append(f"{i}. {name} ({ratio_txt}) -- {desc} Tujuan: {goal}. {note}")
     return "\n".join(lines)
 
 
 PROMPT = """Kamu content strategist buat brand xharp.dev (software development & design studio).
-Format konten: carousel Instagram feed, tone edukatif tapi engaging, bahasa Indonesia santai-profesional.
+Konten buat Instagram, dua format yang bisa dipilih tiap ide:
+- Feed: carousel evergreen, tersimpan di grid & gampang ditemukan lewat search/profil. Cocok buat
+  tutorial/case-study/insight yang perlu disimpan & dibaca ulang.
+- Story: konten cepat & spontan, cocok quick tips/teaser, otomatis hilang dalam 24 jam.
+Tone: edukatif tapi engaging, bahasa Indonesia santai-profesional.
 
 Tanggal hari ini: {today}.
 
@@ -72,14 +88,19 @@ dalam jangka beberapa minggu -- TIDAK harus persis rasionya tiap hari):
 
 {pillar_block}
 
-Tugas kamu: pilih {n_ideas} ide konten hari ini. Campur pillar-nya sesuai aturan di atas -- jangan numpuk
-di satu pillar, dan khususnya jangan melulu soal API/backend generik.
+Tugas kamu: generate ide konten hari ini PER PILLAR:
+- Tiap pillar (kecuali Hari Besar) hasilkan {min_per_pillar}-{max_per_pillar} ide. Sesuaikan jumlahnya
+  sama ketersediaan & kualitas sumber yang relevan -- jangan maksain jumlah kalau sumbernya tipis.
+- Pillar Hari Besar diisi maksimal {max_per_pillar} ide HANYA kalau ada hari besar/perayaan yang jatuh
+  dalam 1-3 hari dari tanggal hari ini. Kalau tidak ada, JANGAN sertakan ide apapun buat pillar ini.
+- Khususnya jangan melulu soal API/backend generik.
 
 Untuk tiap ide, keluarkan field:
 - pillar: salah satu dari nama pillar di atas (persis sama penulisannya)
-- hook: satu kalimat pembuka yang nge-hook buat slide 1
+- format: "Feed" atau "Story" -- pilih yang paling cocok sama isi & bobot ide ini
+- hook: satu kalimat pembuka yang nge-hook buat slide/frame pertama
 - angle: penjelasan sudut pandang/kenapa ide ini menarik (1-2 kalimat)
-- outline: array 5-7 slide, tiap slide berupa object {{"slide_title": judul singkat slide, "copy": draft
+- outline: array 5-7 slide/frame, tiap slide berupa object {{"slide_title": judul singkat slide, "copy": draft
   copywriting SIAP PAKAI untuk slide itu (2-4 kalimat, bukan cuma judul)}}
 - source: link URL sumber yang jadi dasar ide (wajib untuk pillar yang butuh sumber asli). Kalau pillar
   Case Study & Portfolio tanpa sumber eksternal, isi dengan "-".
@@ -117,6 +138,8 @@ def _validate_idea(i, idea):
         raise RuntimeError(f"Ide #{i} kehilangan field {missing}: {idea!r}")
     if idea["pillar"] not in PILLAR_NAMES:
         raise RuntimeError(f"Ide #{i} pakai pillar tidak dikenal: {idea['pillar']!r}")
+    if idea["format"] not in FORMATS:
+        raise RuntimeError(f"Ide #{i} pakai format tidak dikenal: {idea['format']!r}")
     if not isinstance(idea["outline"], list) or not idea["outline"]:
         raise RuntimeError(f"Ide #{i} outline kosong/tidak valid: {idea!r}")
     for slide in idea["outline"]:
@@ -132,7 +155,8 @@ def synthesize(client, items):
         today=datetime.date.today().isoformat(),
         n_pillars=len(PILLARS),
         pillar_block=_pillar_prompt_block(),
-        n_ideas=IDEAS_PER_DAY,
+        min_per_pillar=MIN_IDEAS_PER_PILLAR,
+        max_per_pillar=MAX_IDEAS_PER_PILLAR,
         sources=json.dumps(items, ensure_ascii=False),
     )
     resp = client.models.generate_content(
@@ -154,26 +178,45 @@ def synthesize(client, items):
     for i, idea in enumerate(ideas):
         _validate_idea(i, idea)
 
-    print(f"[agent] synthesize {len(ideas)} ide konten")
+    counts = {}
+    for idea in ideas:
+        counts[idea["pillar"]] = counts.get(idea["pillar"], 0) + 1
+    for name in PILLAR_NAMES:
+        n = counts.get(name, 0)
+        if name != "Hari Besar" and not (MIN_IDEAS_PER_PILLAR <= n <= MAX_IDEAS_PER_PILLAR):
+            print(f"[agent] peringatan: pillar '{name}' dapat {n} ide (di luar target {MIN_IDEAS_PER_PILLAR}-{MAX_IDEAS_PER_PILLAR})")
+
+    print(f"[agent] synthesize {len(ideas)} ide konten -- {counts}")
     return ideas
 
 
 def _render_markdown(ideas):
+    by_pillar = {name: [] for name in PILLAR_NAMES}
+    for idea in ideas:
+        by_pillar[idea["pillar"]].append(idea)
+
     parts = []
-    for i in ideas:
-        placeholder = i["pillar"] in PLACEHOLDER_PILLARS
-        parts.append(f"## [{i['pillar']}] {i['hook']}\n\n")
+    for pillar in PILLAR_NAMES:
+        items = by_pillar[pillar]
+        if not items:
+            continue
+        placeholder = pillar in PLACEHOLDER_PILLARS
+        parts.append(f"## {pillar}\n\n")
         if placeholder:
             parts.append("> ⚠️ **TEMPLATE — isi manual sebelum posting** (tidak ada data sumber asli untuk pillar ini)\n\n")
-        parts.append(f"**Angle:** {i['angle']}\n\n")
-        parts.append("**Slide-by-slide:**\n")
-        for n, s in enumerate(i["outline"], start=1):
-            parts.append(f"{n}. **{s['slide_title']}** — {s['copy']}\n")
-        source = (i.get("source") or "-").strip()
-        if source and source != "-":
-            parts.append(f"\n[Sumber]({source})\n\n---\n\n")
-        else:
-            parts.append("\nSumber: - (internal)\n\n---\n\n")
+        for n, idea in enumerate(items, start=1):
+            fmt = idea["format"]
+            parts.append(f"### {n}. {idea['hook']} _(Format: {fmt} — {FORMATS[fmt]})_\n\n")
+            parts.append(f"**Angle:** {idea['angle']}\n\n")
+            parts.append("**Slide-by-slide:**\n")
+            for s_n, s in enumerate(idea["outline"], start=1):
+                parts.append(f"{s_n}. **{s['slide_title']}** — {s['copy']}\n")
+            source = (idea.get("source") or "-").strip()
+            if source and source != "-":
+                parts.append(f"\n[Sumber]({source})\n\n")
+            else:
+                parts.append("\nSumber: - (internal)\n\n")
+            parts.append("---\n\n")
     return "".join(parts)
 
 
@@ -182,7 +225,7 @@ def save(ideas):
     os.makedirs("research", exist_ok=True)
     path = f"research/{today}.md"
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# Ide konten {today}\n\n")
+        f.write(f"# content_{today}\n\n")
         f.write(_render_markdown(ideas))
     print(f"[agent] tersimpan di {path}")
     return path
@@ -193,7 +236,7 @@ def write_summary(ideas):
     if not summary_path:
         return  # lagi jalan lokal, skip
     with open(summary_path, "a", encoding="utf-8") as f:
-        f.write(f"# Ide konten {datetime.date.today().isoformat()}\n\n")
+        f.write(f"# content_{datetime.date.today().isoformat()}\n\n")
         f.write(_render_markdown(ideas))
 
 

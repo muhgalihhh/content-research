@@ -12,6 +12,10 @@ RSS_FEEDS = [
     "https://css-tricks.com/feed/",
     "https://laravel-news.com/feed",
     "https://nextjs.org/feed.xml",
+    # tips & rekomendasi tools yang lebih ringan/non-teknis (pillar: Tech & Tutorial)
+    "https://www.makeuseof.com/category/programming/feed/",
+    "https://www.freecodecamp.org/news/rss/",
+    "https://zapier.com/blog/feed/",
     # design & UI/UX (pillar: Design & UI/UX)
     "https://www.smashingmagazine.com/feed/",
     "https://uxdesign.cc/feed",
