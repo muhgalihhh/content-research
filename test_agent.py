@@ -34,6 +34,18 @@ class _FakeClient:
         self.models = type("M", (), {"generate_content": lambda *a, **k: resp})()
 
 
+def test_generate_fallback_saat_model_overload():
+    calls = []
+    def gen(model, **k):
+        calls.append(model)
+        if len(calls) == 1:
+            raise agent.errors.ServerError(503, {"error": {"code": 503, "message": "x", "status": "UNAVAILABLE"}})
+        return type("R", (), {"text": "[]"})()
+    client = type("C", (), {"models": type("M", (), {"generate_content": staticmethod(gen)})()})()
+    assert agent._generate(client, "p", {}) == []
+    assert calls == agent.MODELS[:2]
+
+
 def _idea(pillar, source_id):
     return {"pillar": pillar, "format": "Feed", "hook": f"hook {pillar} {source_id}", "angle": "a",
             "outline": [{"slide_title": "t", "copy": "c"}], "source_id": source_id}

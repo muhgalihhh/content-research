@@ -1,9 +1,12 @@
 import os, re, json, glob, datetime, httpx
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from sources import fetch_rss, fetch_github_trending, fetch_article
 
-MODEL = "gemini-3.8-flash"  # terbaru di free tier; "gemini-4-argon" lebih baru tapi butuh billing. Cek: https://ai.google.dev/gemini-api/docs/models
+# urutan fallback kalau model di depannya overload (503) / kena kuota (429). Semua ada di free tier;
+# "gemini-4-argon" lebih baru tapi butuh billing. Cek: https://ai.google.dev/gemini-api/docs/models
+MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+RETRYABLE_CODES = {429, 500, 503, 504}
 MIN_IDEAS_PER_PILLAR = 1
 MAX_IDEAS_PER_PILLAR = 3
 HISTORY_DAYS = 7  # hook N hari terakhir dikirim ke Gemini supaya topiknya nggak diulang-ulang
@@ -201,14 +204,21 @@ def get_client():
 
 
 def _generate(client, prompt, schema):
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=schema,
-        ),
-    )
+    for model in MODELS:
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                ),
+            )
+            break
+        except errors.APIError as exc:
+            if exc.code not in RETRYABLE_CODES or model == MODELS[-1]:
+                raise
+            print(f"[agent] {model} gagal ({exc.code} {exc.status}), fallback ke model berikutnya")
     try:
         data = json.loads(resp.text)
     except (json.JSONDecodeError, TypeError) as exc:
