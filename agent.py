@@ -3,7 +3,7 @@ from google import genai
 from google.genai import types
 from sources import fetch_rss, fetch_github_trending, fetch_article
 
-MODEL = "gemini-4-argon"  # tanpa free tier (butuh billing); opsi gratis: "gemini-3.8-flash". Cek: https://ai.google.dev/gemini-api/docs/models
+MODEL = "gemini-3.8-flash"  # terbaru di free tier; "gemini-4-argon" lebih baru tapi butuh billing. Cek: https://ai.google.dev/gemini-api/docs/models
 MIN_IDEAS_PER_PILLAR = 1
 MAX_IDEAS_PER_PILLAR = 3
 HISTORY_DAYS = 7  # hook N hari terakhir dikirim ke Gemini supaya topiknya nggak diulang-ulang
