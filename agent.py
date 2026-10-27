@@ -1,10 +1,12 @@
-import os, json, datetime, httpx
+import os, re, json, glob, datetime, httpx
 from google import genai
 from google.genai import types
-from sources import fetch_rss, fetch_github_trending
+from sources import fetch_rss, fetch_github_trending, fetch_article
 
+MODEL = "gemini-4-argon"  # tanpa free tier (butuh billing); opsi gratis: "gemini-3.8-flash". Cek: https://ai.google.dev/gemini-api/docs/models
 MIN_IDEAS_PER_PILLAR = 1
 MAX_IDEAS_PER_PILLAR = 3
+HISTORY_DAYS = 7  # hook N hari terakhir dikirim ke Gemini supaya topiknya nggak diulang-ulang
 
 # format konten -> keterangan kegunaannya (ditampilin di samping judul tiap ide)
 FORMATS = {
@@ -12,20 +14,59 @@ FORMATS = {
     "Story": "konten cepat & spontan, cocok quick tips/teaser, otomatis hilang dalam 24 jam",
 }
 
-# pillar -> (deskripsi, rasio target %, tujuan, ada data sumber asli?)
+# pillar -> (deskripsi, tujuan, ada data sumber asli?)
 PILLARS = {
-    "Tech & Tutorial": ("Tips & trik praktis buat developer sehari-hari, rekomendasi tools/website & AI assistant kekinian yang beneran berguna, produktivitas & soft skill kerja dev. Mini-tutorial framework (Laravel, Next.js, FastAPI) boleh sesekali tapi bukan mayoritas.", 25, "Bangun kredibilitas teknis", True),
-    "Design & UI/UX": ("Proses desain, breakdown UI, tips Figma, before/after.", 25, "Tunjukin skill desain", True),
-    "Case Study & Portfolio": ("Showcase project, hasil kerja, cerita di balik project.", 25, "Konversi ke klien", False),
-    "IT & Tech Industry": ("Berita/tren industri IT non-teknis -- bisnis software, AI di dunia kerja, produk/startup, arah industri.", 25, "Relevansi & insight industri", True),
-    "Hari Besar": ("Konten menyambut hari besar/perayaan nasional atau internasional yang dekat tanggal hari ini.", None, "Merayakan Hari Besar", False),
+    "Tech & Tutorial": ("Tips & trik praktis buat developer sehari-hari, rekomendasi tools/website & AI assistant kekinian yang beneran berguna, produktivitas & soft skill kerja dev. Bahasa gampang dicerna, bukan deep-dive kode yang cuma dimengerti senior dev. Mini-tutorial framework (Laravel, Next.js, FastAPI) boleh sesekali tapi bukan mayoritas.", "Bangun kredibilitas teknis", True),
+    "Design & UI/UX": ("Proses desain, breakdown UI, tips Figma, before/after.", "Tunjukin skill desain", True),
+    "Case Study & Portfolio": ("Showcase project, hasil kerja, cerita di balik project.", "Konversi ke klien", False),
+    "IT & Tech Industry": ("Berita/tren industri IT non-teknis -- bisnis software, AI di dunia kerja, produk/startup (termasuk ekosistem tech Indonesia), arah industri.", "Relevansi & insight industri", True),
+    "Hari Besar": ("Konten menyambut hari besar/perayaan nasional atau internasional yang dekat tanggal hari ini.", "Merayakan Hari Besar", False),
 }
 PILLAR_NAMES = list(PILLARS.keys())
-PLACEHOLDER_PILLARS = {name for name, meta in PILLARS.items() if not meta[3]}
+GROUNDED_PILLARS = [name for name, meta in PILLARS.items() if meta[2]]
+PLACEHOLDER_PILLARS = {name for name, meta in PILLARS.items() if not meta[2]}
 
-REQUIRED_FIELDS = ("pillar", "format", "hook", "angle", "outline", "source")
+# MM-DD -> nama. Tanggal pasti dari kode, bukan dari ingatan Gemini (dulu sering meleset/kelewat).
+# Hari besar kalender lunar (Idulfitri, Iduladha, Imlek, Nyepi, Waisak, dll.) geser tiap tahun: tambah manual per tahun.
+HARI_BESAR = {
+    "01-01": "Tahun Baru Masehi",
+    "02-09": "Hari Pers Nasional",
+    "03-08": "Hari Perempuan Internasional",
+    "04-21": "Hari Kartini",
+    "05-02": "Hari Pendidikan Nasional",
+    "05-20": "Hari Kebangkitan Nasional",
+    "06-01": "Hari Lahir Pancasila",
+    "08-17": "HUT Kemerdekaan RI",
+    "09-13": "Hari Programmer",  # hari ke-256; tahun kabisat jatuh 09-12
+    "10-01": "Hari Kesaktian Pancasila",
+    "10-02": "Hari Batik Nasional",
+    "10-10": "Hari Kesehatan Mental Sedunia",
+    "10-28": "Hari Sumpah Pemuda",
+    "11-10": "Hari Pahlawan",
+    "11-25": "Hari Guru Nasional",
+    "12-22": "Hari Ibu",
+    "12-25": "Hari Natal",
+}
+HARI_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+BULAN_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+            "Agustus", "September", "Oktober", "November", "Desember"]
 
-RESPONSE_SCHEMA = {
+REQUIRED_FIELDS = ("pillar", "format", "hook", "angle", "outline", "source_id")
+
+SELECT_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "pillar": {"type": "string", "enum": GROUNDED_PILLARS},
+            "why": {"type": "string"},
+        },
+        "required": ["id", "pillar", "why"],
+    },
+}
+
+WRITE_SCHEMA = {
     "type": "array",
     "minItems": 1,
     "items": {
@@ -46,35 +87,32 @@ RESPONSE_SCHEMA = {
                     "required": ["slide_title", "copy"],
                 },
             },
-            "source": {"type": "string"},
+            "source_id": {"type": "integer"},
         },
         "required": list(REQUIRED_FIELDS),
     },
 }
 
+SELECT_PROMPT = """Kamu editor konten Instagram brand xharp.dev (software development & design studio).
+Audiens: developer, desainer, & orang yang tertarik dunia IT di Indonesia.
+Tanggal hari ini: {today}.
 
-def _pillar_prompt_block():
-    lines = []
-    for i, (name, (desc, ratio, goal, grounded)) in enumerate(PILLARS.items(), start=1):
-        ratio_txt = f"{ratio}%" if ratio is not None else "kondisional"
-        note = (
-            "WAJIB berdasarkan salah satu item di daftar sumber di bawah."
-            if grounded else
-            "TIDAK ada data asli tersedia -- buat sebagai TEMPLATE dengan placeholder eksplisit dalam kurung siku, "
-            "misal \"[NAMA PROJECT]\" atau \"[CERITA HARI INI]\"."
-        )
-        if name == "Hari Besar":
-            note = ("HANYA pilih pillar ini kalau ada hari besar/perayaan nasional atau internasional yang jatuh "
-                    "dalam 1-3 hari dari tanggal hari ini. Kalau tidak ada, JANGAN pakai pillar ini sama sekali.")
-        elif name == "Tech & Tutorial":
-            note += (" Prioritaskan bahasa yang gampang dicerna, jangan jargon-heavy atau deep-dive kode yang "
-                      "cuma dimengerti senior dev -- fokus ke value praktis (tips, tools, produktivitas). "
-                      "Mini-tutorial kode spesifik boleh muncul sesekali tapi jangan jadi mayoritas ide di pillar ini.")
-        lines.append(f"{i}. {name} ({ratio_txt}) -- {desc} Tujuan: {goal}. {note}")
-    return "\n".join(lines)
+Dari daftar sumber di bawah, pilih yang PALING layak dijadikan konten hari ini untuk pillar berikut:
+{pillar_block}
 
+Kriteria (urut prioritas):
+1. Bermanfaat & relevan buat audiens di atas -- bukan berita receh, clickbait, atau drama.
+2. Ada alasan kenapa dibahas SEKARANG: rilis baru, update besar, tren, kejadian minggu ini.
+3. Topik yang muncul di beberapa sumber sekaligus berarti lagi hangat -- prioritaskan.
+4. JANGAN pilih topik yang sama/mirip dengan konten {history_days} hari terakhir ini:
+{recent_hooks}
 
-PROMPT = """Kamu content strategist buat brand xharp.dev (software development & design studio).
+Pilih {min_per_pillar}-{max_per_pillar} sumber per pillar; lebih sedikit kalau kandidatnya tipis, jangan maksa.
+Satu sumber hanya boleh dipilih sekali. Isi "why" dengan 1 kalimat alasan memilih.
+Balas HANYA JSON array sesuai schema. Daftar sumber (pakai "id"-nya):
+{sources}"""
+
+WRITE_PROMPT = """Kamu content strategist buat brand xharp.dev (software development & design studio).
 Konten buat Instagram, dua format yang bisa dipilih tiap ide:
 - Feed: carousel evergreen, tersimpan di grid & gampang ditemukan lewat search/profil. Cocok buat
   tutorial/case-study/insight yang perlu disimpan & dibaca ulang.
@@ -83,30 +121,76 @@ Tone: edukatif tapi engaging, bahasa Indonesia santai-profesional.
 
 Tanggal hari ini: {today}.
 
-Ada {n_pillars} content pillar dengan rasio target (pilih pillar secara weighted-random mengikuti rasio ini
-dalam jangka beberapa minggu -- TIDAK harus persis rasionya tiap hari):
-
+Content pillar:
 {pillar_block}
 
-Tugas kamu: generate ide konten hari ini PER PILLAR:
-- Tiap pillar (kecuali Hari Besar) hasilkan {min_per_pillar}-{max_per_pillar} ide. Sesuaikan jumlahnya
-  sama ketersediaan & kualitas sumber yang relevan -- jangan maksain jumlah kalau sumbernya tipis.
-- Pillar Hari Besar diisi maksimal {max_per_pillar} ide HANYA kalau ada hari besar/perayaan yang jatuh
-  dalam 1-3 hari dari tanggal hari ini. Kalau tidak ada, JANGAN sertakan ide apapun buat pillar ini.
-- Khususnya jangan melulu soal API/backend generik.
+Tugas kamu:
+1. Untuk TIAP sumber di daftar bawah, buat tepat 1 ide di pillar yang tertulis, isi source_id = id sumbernya.
+   Fakta, angka, nama fitur/produk, & klaim di copy WAJIB berasal dari "content" sumber itu. Kalau content-nya
+   tipis, bahas secara umum -- JANGAN ngarang detail spesifik yang nggak ada di content.
+2. Buat {min_per_pillar}-2 ide pillar Case Study & Portfolio sebagai TEMPLATE dengan placeholder eksplisit
+   dalam kurung siku, misal "[NAMA PROJECT]" atau "[HASIL/ANGKA]". source_id = 0.
+3. Hari besar dalam 0-3 hari ke depan (hari & tanggal ini SUDAH PASTI benar -- pakai persis, jangan hitung
+   ulang, jangan tambah hari besar lain):
+{hari_besar}
+   Buat maksimal 1 ide pillar Hari Besar per hari besar di atas, source_id = 0. Kalau "(tidak ada)", JANGAN
+   buat ide pillar Hari Besar sama sekali.
+4. Hook & sudut pandang jangan mirip konten {history_days} hari terakhir ini:
+{recent_hooks}
 
 Untuk tiap ide, keluarkan field:
 - pillar: salah satu dari nama pillar di atas (persis sama penulisannya)
 - format: "Feed" atau "Story" -- pilih yang paling cocok sama isi & bobot ide ini
 - hook: satu kalimat pembuka yang nge-hook buat slide/frame pertama
-- angle: penjelasan sudut pandang/kenapa ide ini menarik (1-2 kalimat)
+- angle: penjelasan sudut pandang/kenapa ide ini menarik buat audiens sekarang (1-2 kalimat)
 - outline: array 5-7 slide/frame, tiap slide berupa object {{"slide_title": judul singkat slide, "copy": draft
   copywriting SIAP PAKAI untuk slide itu (2-4 kalimat, bukan cuma judul)}}
-- source: link URL sumber yang jadi dasar ide (wajib untuk pillar yang butuh sumber asli). Kalau pillar
-  Case Study & Portfolio tanpa sumber eksternal, isi dengan "-".
+- source_id: id sumber dari daftar di bawah, atau 0 untuk Case Study & Portfolio / Hari Besar
 
 Balas HANYA JSON array sesuai schema. Daftar sumber:
 {sources}"""
+
+
+def tanggal_id(d):
+    return f"{HARI_ID[d.weekday()]}, {d.day} {BULAN_ID[d.month - 1]} {d.year}"
+
+
+def upcoming_hari_besar(today, days=3):
+    """Hari besar dari hari ini s/d `days` hari ke depan, lengkap dengan hari & tanggal yang benar."""
+    out = []
+    for n in range(days + 1):
+        d = today + datetime.timedelta(days=n)
+        name = HARI_BESAR.get(d.strftime("%m-%d"))
+        if name:
+            out.append(f"{name} -- {tanggal_id(d)} ({'hari ini' if n == 0 else f'H-{n}'})")
+    return out
+
+
+def load_history(today, days=HISTORY_DAYS, folder="research"):
+    """Dari output riset sebelumnya (tidak termasuk hari ini, biar re-run manual tetap bebas):
+    (semua link sumber yang pernah dipakai, hook ide `days` hari terakhir)."""
+    used_links, recent_hooks = set(), []
+    for path in sorted(glob.glob(os.path.join(folder, "*.md"))):
+        try:
+            age = (today - datetime.date.fromisoformat(os.path.basename(path)[:-3])).days
+        except ValueError:
+            continue
+        if age <= 0:
+            continue
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        used_links.update(re.findall(r"\[Sumber\]\((https?://[^)]+)\)", text))
+        if age <= days:
+            recent_hooks += re.findall(r"^### \d+\. (.+?) _\(Format", text, re.M)
+    return used_links, recent_hooks
+
+
+def _bullets(lines):
+    return "\n".join(f"   - {x}" for x in lines) or "   (tidak ada)"
+
+
+def _pillar_block(names):
+    return "\n".join(f"- {n} -- {PILLARS[n][0]} Tujuan: {PILLARS[n][1]}." for n in names)
 
 
 def get_client():
@@ -116,20 +200,68 @@ def get_client():
     return genai.Client(api_key=api_key)
 
 
-def collect():
+def _generate(client, prompt, schema):
+    resp = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+    try:
+        data = json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError(f"Gagal parse JSON dari Gemini: {exc}\nRaw response: {resp.text!r}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError(f"Response Gemini bukan JSON array: {data!r}")
+    return data
+
+
+def collect(used_links):
     items = fetch_rss()
     try:
         items += fetch_github_trending()
     except Exception as exc:
         print(f"[agent] gagal fetch GitHub trending: {exc}")
 
-    seen, uniq = set(), []
+    # dedup per judul/link + buang yang sudah pernah jadi sumber konten di hari-hari sebelumnya
+    seen, uniq = set(used_links), []
     for it in items:
-        if it["title"] not in seen:
-            seen.add(it["title"])
-            uniq.append(it)
-    print(f"[agent] total {len(uniq)} sumber unik terkumpul")
+        if it["title"] in seen or it["link"] in seen:
+            continue
+        seen.update((it["title"], it["link"]))
+        uniq.append(it)
+    print(f"[agent] total {len(uniq)} sumber unik & belum pernah dipakai")
     return uniq
+
+
+def select(client, items, today, recent_hooks):
+    """Tahap 1: Gemini cuma milih sumber terbaik per pillar (belum nulis apa-apa)."""
+    if not items:
+        raise RuntimeError("Tidak ada sumber yang berhasil di-fetch, skip synthesize.")
+    prompt = SELECT_PROMPT.format(
+        today=tanggal_id(today),
+        pillar_block=_pillar_block(GROUNDED_PILLARS),
+        history_days=HISTORY_DAYS,
+        recent_hooks=_bullets(recent_hooks),
+        min_per_pillar=MIN_IDEAS_PER_PILLAR,
+        max_per_pillar=MAX_IDEAS_PER_PILLAR,
+        sources=json.dumps([{"id": i, **it} for i, it in enumerate(items)], ensure_ascii=False),
+    )
+    picks, used_ids, per_pillar = [], set(), {}
+    for p in _generate(client, prompt, SELECT_SCHEMA):
+        i, pillar = p.get("id"), p.get("pillar")
+        if not isinstance(i, int) or not 0 <= i < len(items) or i in used_ids or pillar not in GROUNDED_PILLARS:
+            print(f"[agent] abaikan pilihan tidak valid: {p!r}")
+            continue
+        if per_pillar.get(pillar, 0) >= MAX_IDEAS_PER_PILLAR:
+            continue
+        used_ids.add(i)
+        per_pillar[pillar] = per_pillar.get(pillar, 0) + 1
+        picks.append({**items[i], "pillar": pillar})
+        print(f"[agent] pilih [{pillar}] {items[i]['title']} -- {p.get('why', '')}")
+    return picks
 
 
 def _validate_idea(i, idea):
@@ -147,36 +279,46 @@ def _validate_idea(i, idea):
             raise RuntimeError(f"Ide #{i} ada slide tanpa slide_title/copy: {slide!r}")
 
 
-def synthesize(client, items):
-    if not items:
-        raise RuntimeError("Tidak ada sumber yang berhasil di-fetch, skip synthesize.")
-
-    prompt = PROMPT.format(
-        today=datetime.date.today().isoformat(),
-        n_pillars=len(PILLARS),
-        pillar_block=_pillar_prompt_block(),
+def write(client, picks, today, recent_hooks, hari_besar):
+    """Tahap 2: tulis ide + copy berdasarkan isi artikel yang dipilih. Link sumber diisi kode dari
+    source_id, jadi Gemini nggak bisa ngarang URL."""
+    sources = []
+    for n, p in enumerate(picks, start=1):
+        text = fetch_article(p["link"])
+        sources.append({
+            "id": n,
+            "pillar": p["pillar"],
+            "title": p["title"],
+            "published": p["published"],
+            "content": text if len(text) > len(p["summary"]) else p["summary"],
+        })
+    prompt = WRITE_PROMPT.format(
+        today=tanggal_id(today),
+        pillar_block=_pillar_block(PILLAR_NAMES),
         min_per_pillar=MIN_IDEAS_PER_PILLAR,
-        max_per_pillar=MAX_IDEAS_PER_PILLAR,
-        sources=json.dumps(items, ensure_ascii=False),
+        hari_besar=_bullets(hari_besar),
+        history_days=HISTORY_DAYS,
+        recent_hooks=_bullets(recent_hooks),
+        sources=json.dumps(sources, ensure_ascii=False),
     )
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",   # cek nama model terbaru di docs Gemini
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA,
-        ),
-    )
-
-    try:
-        ideas = json.loads(resp.text)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise RuntimeError(f"Gagal parse JSON dari Gemini: {exc}\nRaw response: {resp.text!r}") from exc
-
-    if not isinstance(ideas, list) or not ideas:
-        raise RuntimeError(f"Response Gemini bukan list ide yang valid: {ideas!r}")
-    for i, idea in enumerate(ideas):
+    links = {n: p["link"] for n, p in enumerate(picks, start=1)}
+    ideas = []
+    for i, idea in enumerate(_generate(client, prompt, WRITE_SCHEMA)):
         _validate_idea(i, idea)
+        sid = idea.pop("source_id")
+        if idea["pillar"] == "Hari Besar" and not hari_besar:
+            print(f"[agent] buang ide #{i}: Hari Besar padahal tidak ada hari besar dekat")
+            continue
+        if idea["pillar"] in PLACEHOLDER_PILLARS:
+            idea["source"] = "-"
+        elif sid in links:
+            idea["source"] = links[sid]
+        else:
+            print(f"[agent] buang ide #{i}: source_id {sid} tidak ada di daftar sumber ({idea['hook']!r})")
+            continue
+        ideas.append(idea)
+    if not ideas:
+        raise RuntimeError("Semua ide dari Gemini tidak valid, tidak ada yang disimpan.")
 
     counts = {}
     for idea in ideas:
@@ -252,8 +394,11 @@ def notify(ideas):
 
 
 if __name__ == "__main__":
+    today = datetime.date.today()  # WIB: workflow set TZ=Asia/Jakarta
     client = get_client()
-    ideas = synthesize(client, collect())
+    used_links, recent_hooks = load_history(today)
+    picks = select(client, collect(used_links), today, recent_hooks)
+    ideas = write(client, picks, today, recent_hooks, upcoming_hari_besar(today))
     save(ideas)
     write_summary(ideas)
     notify(ideas)   # opsional, best-effort, tidak menggagalkan run kalau error

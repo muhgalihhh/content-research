@@ -13,6 +13,8 @@ jobs:
   research:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      TZ: Asia/Jakarta # date.today() & `date +%F` ikut WIB, bukan UTC
     permissions:
       contents: write
     steps:
