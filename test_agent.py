@@ -42,8 +42,17 @@ def test_generate_fallback_saat_model_overload():
             raise agent.errors.ServerError(503, {"error": {"code": 503, "message": "x", "status": "UNAVAILABLE"}})
         return type("R", (), {"text": "[]"})()
     client = type("C", (), {"models": type("M", (), {"generate_content": staticmethod(gen)})()})()
-    assert agent._generate(client, "p", {}) == []
+    assert agent._generate(client, "p", {}) == ([], agent.MODELS[1])  # model yang benar-benar dipakai
     assert calls == agent.MODELS[:2]
+
+    calls.clear()  # request menggantung -> httpx timeout (bukan APIError) juga harus fallback
+    def hang(model, **k):
+        calls.append(model)
+        if len(calls) == 1:
+            raise agent.httpx.ReadTimeout("timed out")
+        return type("R", (), {"text": "[]"})()
+    client.models.generate_content = hang
+    assert agent._generate(client, "p", {}) == ([], agent.MODELS[1])
 
 
 def _idea(pillar, source_id):
@@ -61,7 +70,7 @@ def test_write_link_dari_kode_bukan_gemini():
         _idea("Case Study & Portfolio", 0),   # template -> "-"
         _idea("Hari Besar", 0),               # tidak ada hari besar -> dibuang
     ])
-    ideas = agent.write(client, picks, datetime.date(2026, 10, 20), [], [])
+    ideas, _ = agent.write(client, picks, datetime.date(2026, 10, 20), [], [])
     assert [(i["pillar"], i["source"]) for i in ideas] == [
         ("Tech & Tutorial", "https://real.com/x"), ("Case Study & Portfolio", "-")]
 
@@ -74,9 +83,14 @@ def test_select_buang_id_tidak_valid():
         {"id": 7, "pillar": "Tech & Tutorial", "why": "out of range"},
         {"id": 1, "pillar": "IT & Tech Industry", "why": "ok"},
     ])
-    picks = agent.select(client, items, datetime.date(2026, 10, 27), [])
+    picks, _ = agent.select(client, items, datetime.date(2026, 10, 27), [])
     assert [(p["link"], p["pillar"]) for p in picks] == [
         ("https://x.com/0", "Tech & Tutorial"), ("https://x.com/1", "IT & Tech Industry")]
+
+
+def test_header_tampilkan_model_dan_tanggal():
+    h = agent._header(datetime.date(2026, 10, 27), {"Tanggal": "Selasa, 27 Oktober 2026", "Model": "gemini-3.8-flash"})
+    assert h.startswith("# content_2026-10-27\n\n- **Tanggal:** Selasa, 27 Oktober 2026\n- **Model:** gemini-3.8-flash\n")
 
 
 if __name__ == "__main__":

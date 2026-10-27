@@ -1,4 +1,4 @@
-import os, re, json, glob, datetime, httpx
+import os, re, json, glob, time, datetime, httpx
 from google import genai
 from google.genai import errors, types
 from sources import fetch_rss, fetch_github_trending, fetch_article
@@ -7,6 +7,7 @@ from sources import fetch_rss, fetch_github_trending, fetch_article
 # "gemini-4-argon" lebih baru tapi butuh billing. Cek: https://ai.google.dev/gemini-api/docs/models
 MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 RETRYABLE_CODES = {429, 500, 503, 504}
+REQUEST_TIMEOUT_S = 180  # tahap tulis (~10 ide x 5-7 slide) normalnya < 2 menit
 MIN_IDEAS_PER_PILLAR = 1
 MAX_IDEAS_PER_PILLAR = 3
 HISTORY_DAYS = 7  # hook N hari terakhir dikirim ke Gemini supaya topiknya nggak diulang-ulang
@@ -200,11 +201,17 @@ def get_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise SystemExit("GEMINI_API_KEY belum di-set (env var / GitHub secret).")
-    return genai.Client(api_key=api_key)
+    # default SDK: tanpa timeout + 5x retry -> model yang overload bisa bikin run menggantung sampai job
+    # di-kill. Timeout + 1x retry bikin gagal cepat, lalu _generate pindah ke model berikutnya.
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(
+        timeout=REQUEST_TIMEOUT_S * 1000,
+        retry_options=types.HttpRetryOptions(attempts=2),
+    ))
 
 
 def _generate(client, prompt, schema):
     for model in MODELS:
+        started = time.monotonic()
         try:
             resp = client.models.generate_content(
                 model=model,
@@ -214,18 +221,21 @@ def _generate(client, prompt, schema):
                     response_schema=schema,
                 ),
             )
+            print(f"[agent] {model} selesai dalam {time.monotonic() - started:.0f} detik")
             break
-        except errors.APIError as exc:
-            if exc.code not in RETRYABLE_CODES or model == MODELS[-1]:
+        except (errors.APIError, httpx.TimeoutException) as exc:  # timeout dilempar httpx, bukan APIError
+            retryable = isinstance(exc, httpx.TimeoutException) or exc.code in RETRYABLE_CODES
+            if not retryable or model == MODELS[-1]:
                 raise
-            print(f"[agent] {model} gagal ({exc.code} {exc.status}), fallback ke model berikutnya")
+            print(f"[agent] {model} gagal setelah {time.monotonic() - started:.0f} detik "
+                  f"({type(exc).__name__}: {str(exc)[:80]}), fallback ke model berikutnya")
     try:
         data = json.loads(resp.text)
     except (json.JSONDecodeError, TypeError) as exc:
         raise RuntimeError(f"Gagal parse JSON dari Gemini: {exc}\nRaw response: {resp.text!r}") from exc
     if not isinstance(data, list):
         raise RuntimeError(f"Response Gemini bukan JSON array: {data!r}")
-    return data
+    return data, model
 
 
 def collect(used_links):
@@ -260,7 +270,8 @@ def select(client, items, today, recent_hooks):
         sources=json.dumps([{"id": i, **it} for i, it in enumerate(items)], ensure_ascii=False),
     )
     picks, used_ids, per_pillar = [], set(), {}
-    for p in _generate(client, prompt, SELECT_SCHEMA):
+    data, model = _generate(client, prompt, SELECT_SCHEMA)
+    for p in data:
         i, pillar = p.get("id"), p.get("pillar")
         if not isinstance(i, int) or not 0 <= i < len(items) or i in used_ids or pillar not in GROUNDED_PILLARS:
             print(f"[agent] abaikan pilihan tidak valid: {p!r}")
@@ -271,7 +282,7 @@ def select(client, items, today, recent_hooks):
         per_pillar[pillar] = per_pillar.get(pillar, 0) + 1
         picks.append({**items[i], "pillar": pillar})
         print(f"[agent] pilih [{pillar}] {items[i]['title']} -- {p.get('why', '')}")
-    return picks
+    return picks, model
 
 
 def _validate_idea(i, idea):
@@ -313,7 +324,8 @@ def write(client, picks, today, recent_hooks, hari_besar):
     )
     links = {n: p["link"] for n, p in enumerate(picks, start=1)}
     ideas = []
-    for i, idea in enumerate(_generate(client, prompt, WRITE_SCHEMA)):
+    data, model = _generate(client, prompt, WRITE_SCHEMA)
+    for i, idea in enumerate(data):
         _validate_idea(i, idea)
         sid = idea.pop("source_id")
         if idea["pillar"] == "Hari Besar" and not hari_besar:
@@ -339,7 +351,7 @@ def write(client, picks, today, recent_hooks, hari_besar):
             print(f"[agent] peringatan: pillar '{name}' dapat {n} ide (di luar target {MIN_IDEAS_PER_PILLAR}-{MAX_IDEAS_PER_PILLAR})")
 
     print(f"[agent] synthesize {len(ideas)} ide konten -- {counts}")
-    return ideas
+    return ideas, model
 
 
 def _render_markdown(ideas):
@@ -372,23 +384,26 @@ def _render_markdown(ideas):
     return "".join(parts)
 
 
-def save(ideas):
-    today = datetime.date.today().isoformat()
+def _header(today, meta):
+    return f"# content_{today.isoformat()}\n\n" + "".join(f"- **{k}:** {v}\n" for k, v in meta.items()) + "\n---\n\n"
+
+
+def save(ideas, today, meta):
     os.makedirs("research", exist_ok=True)
-    path = f"research/{today}.md"
+    path = f"research/{today.isoformat()}.md"
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# content_{today}\n\n")
+        f.write(_header(today, meta))
         f.write(_render_markdown(ideas))
     print(f"[agent] tersimpan di {path}")
     return path
 
 
-def write_summary(ideas):
+def write_summary(ideas, today, meta):
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return  # lagi jalan lokal, skip
     with open(summary_path, "a", encoding="utf-8") as f:
-        f.write(f"# content_{datetime.date.today().isoformat()}\n\n")
+        f.write(_header(today, meta))
         f.write(_render_markdown(ideas))
 
 
@@ -407,8 +422,18 @@ if __name__ == "__main__":
     today = datetime.date.today()  # WIB: workflow set TZ=Asia/Jakarta
     client = get_client()
     used_links, recent_hooks = load_history(today)
-    picks = select(client, collect(used_links), today, recent_hooks)
-    ideas = write(client, picks, today, recent_hooks, upcoming_hari_besar(today))
-    save(ideas)
-    write_summary(ideas)
+    hari_besar = upcoming_hari_besar(today)
+    items = collect(used_links)
+    picks, select_model = select(client, items, today, recent_hooks)
+    ideas, write_model = write(client, picks, today, recent_hooks, hari_besar)
+    meta = {
+        "Tanggal": tanggal_id(today),
+        "Di-generate": datetime.datetime.now().astimezone().strftime("%H:%M %Z"),
+        "Model": select_model if select_model == write_model
+                 else f"{select_model} (pilih sumber), {write_model} (tulis konten)",
+        "Sumber": f"{len(items)} kandidat fresh → {len(picks)} dipilih",
+        "Hari besar dekat": "; ".join(hari_besar) or "-",
+    }
+    save(ideas, today, meta)
+    write_summary(ideas, today, meta)
     notify(ideas)   # opsional, best-effort, tidak menggagalkan run kalau error
