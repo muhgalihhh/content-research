@@ -7,9 +7,9 @@ from sources import fetch_rss, fetch_github_trending, fetch_article
 # "gemini-4-argon" lebih baru tapi butuh billing. Cek: https://ai.google.dev/gemini-api/docs/models
 MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 RETRYABLE_CODES = {429, 500, 503, 504}
-REQUEST_TIMEOUT_S = 180  # tahap tulis (~10 ide x 5-7 slide) normalnya < 2 menit
-MIN_IDEAS_PER_PILLAR = 1
-MAX_IDEAS_PER_PILLAR = 3
+REQUEST_TIMEOUT_S = 180  # tahap tulis (maks ~14 ide x 5-7 slide) normalnya < 2 menit
+# target jumlah ide per hari (min, max) per pillar bersumber; Tech & Tutorial pillar utama -> jatah terbanyak
+IDEAS_PER_PILLAR = {"Tech & Tutorial": (3, 5), "Design & UI/UX": (1, 3), "IT & Tech Industry": (1, 3)}
 HISTORY_DAYS = 7  # hook N hari terakhir dikirim ke Gemini supaya topiknya nggak diulang-ulang
 
 # format konten -> keterangan kegunaannya (ditampilin di samping judul tiap ide)
@@ -111,7 +111,9 @@ Kriteria (urut prioritas):
 4. JANGAN pilih topik yang sama/mirip dengan konten {history_days} hari terakhir ini:
 {recent_hooks}
 
-Pilih {min_per_pillar}-{max_per_pillar} sumber per pillar; lebih sedikit kalau kandidatnya tipis, jangan maksa.
+Jumlah sumber per pillar ikuti angka "pilih X-Y" di tiap pillar. Boleh di bawah minimum HANYA kalau memang
+nggak ada kandidat yang layak -- jangan pilih sumber jelek demi memenuhi jumlah. Di pillar yang slotnya banyak,
+variasikan sub-topiknya (mis. tools/AI assistant, tips produktivitas, tutorial singkat), jangan semua sejenis.
 Satu sumber hanya boleh dipilih sekali. Isi "why" dengan 1 kalimat alasan memilih.
 Balas HANYA JSON array sesuai schema. Daftar sumber (pakai "id"-nya):
 {sources}"""
@@ -132,7 +134,7 @@ Tugas kamu:
 1. Untuk TIAP sumber di daftar bawah, buat tepat 1 ide di pillar yang tertulis, isi source_id = id sumbernya.
    Fakta, angka, nama fitur/produk, & klaim di copy WAJIB berasal dari "content" sumber itu. Kalau content-nya
    tipis, bahas secara umum -- JANGAN ngarang detail spesifik yang nggak ada di content.
-2. Buat {min_per_pillar}-2 ide pillar Case Study & Portfolio sebagai TEMPLATE dengan placeholder eksplisit
+2. Buat 1-2 ide pillar Case Study & Portfolio sebagai TEMPLATE dengan placeholder eksplisit
    dalam kurung siku, misal "[NAMA PROJECT]" atau "[HASIL/ANGKA]". source_id = 0.
 3. Hari besar dalam 0-3 hari ke depan (hari & tanggal ini SUDAH PASTI benar -- pakai persis, jangan hitung
    ulang, jangan tambah hari besar lain):
@@ -262,11 +264,10 @@ def select(client, items, today, recent_hooks):
         raise RuntimeError("Tidak ada sumber yang berhasil di-fetch, skip synthesize.")
     prompt = SELECT_PROMPT.format(
         today=tanggal_id(today),
-        pillar_block=_pillar_block(GROUNDED_PILLARS),
+        pillar_block="\n".join(f"- {n} (pilih {lo}-{hi} sumber) -- {PILLARS[n][0]}"
+                               for n, (lo, hi) in IDEAS_PER_PILLAR.items()),
         history_days=HISTORY_DAYS,
         recent_hooks=_bullets(recent_hooks),
-        min_per_pillar=MIN_IDEAS_PER_PILLAR,
-        max_per_pillar=MAX_IDEAS_PER_PILLAR,
         sources=json.dumps([{"id": i, **it} for i, it in enumerate(items)], ensure_ascii=False),
     )
     picks, used_ids, per_pillar = [], set(), {}
@@ -276,7 +277,7 @@ def select(client, items, today, recent_hooks):
         if not isinstance(i, int) or not 0 <= i < len(items) or i in used_ids or pillar not in GROUNDED_PILLARS:
             print(f"[agent] abaikan pilihan tidak valid: {p!r}")
             continue
-        if per_pillar.get(pillar, 0) >= MAX_IDEAS_PER_PILLAR:
+        if per_pillar.get(pillar, 0) >= IDEAS_PER_PILLAR[pillar][1]:
             continue
         used_ids.add(i)
         per_pillar[pillar] = per_pillar.get(pillar, 0) + 1
@@ -316,7 +317,6 @@ def write(client, picks, today, recent_hooks, hari_besar):
     prompt = WRITE_PROMPT.format(
         today=tanggal_id(today),
         pillar_block=_pillar_block(PILLAR_NAMES),
-        min_per_pillar=MIN_IDEAS_PER_PILLAR,
         hari_besar=_bullets(hari_besar),
         history_days=HISTORY_DAYS,
         recent_hooks=_bullets(recent_hooks),
@@ -345,10 +345,10 @@ def write(client, picks, today, recent_hooks, hari_besar):
     counts = {}
     for idea in ideas:
         counts[idea["pillar"]] = counts.get(idea["pillar"], 0) + 1
-    for name in PILLAR_NAMES:
+    for name, (lo, hi) in IDEAS_PER_PILLAR.items():
         n = counts.get(name, 0)
-        if name != "Hari Besar" and not (MIN_IDEAS_PER_PILLAR <= n <= MAX_IDEAS_PER_PILLAR):
-            print(f"[agent] peringatan: pillar '{name}' dapat {n} ide (di luar target {MIN_IDEAS_PER_PILLAR}-{MAX_IDEAS_PER_PILLAR})")
+        if not lo <= n <= hi:
+            print(f"[agent] peringatan: pillar '{name}' dapat {n} ide (di luar target {lo}-{hi})")
 
     print(f"[agent] synthesize {len(ideas)} ide konten -- {counts}")
     return ideas, model

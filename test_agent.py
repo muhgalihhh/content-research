@@ -88,6 +88,20 @@ def test_select_buang_id_tidak_valid():
         ("https://x.com/0", "Tech & Tutorial"), ("https://x.com/1", "IT & Tech Industry")]
 
 
+def test_select_ikut_target_per_pillar():
+    items = [{"title": f"t{i}", "link": f"https://x.com/{i}", "published": "", "summary": ""} for i in range(10)]
+    prompts = []
+    resp = type("R", (), {"text": json.dumps(
+        [{"id": i, "pillar": "Tech & Tutorial", "why": "ok"} for i in range(6)]
+        + [{"id": i, "pillar": "Design & UI/UX", "why": "ok"} for i in range(6, 10)])})()
+    client = type("C", (), {"models": type("M", (), {
+        "generate_content": staticmethod(lambda **k: prompts.append(k["contents"]) or resp)})()})()
+    picks, _ = agent.select(client, items, datetime.date(2026, 10, 27), [])
+    count = lambda name: sum(p["pillar"] == name for p in picks)
+    assert count("Tech & Tutorial") == 5 and count("Design & UI/UX") == 3  # dipotong di batas atas pillar
+    assert "Tech & Tutorial (pilih 3-5 sumber)" in prompts[0]
+
+
 def test_header_tampilkan_model_dan_tanggal():
     h = agent._header(datetime.date(2026, 10, 27), {"Tanggal": "Selasa, 27 Oktober 2026", "Model": "gemini-3.8-flash"})
     assert h.startswith("# content_2026-10-27\n\n- **Tanggal:** Selasa, 27 Oktober 2026\n- **Model:** gemini-3.8-flash\n")
