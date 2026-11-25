@@ -55,10 +55,34 @@ def test_generate_fallback_saat_model_overload():
     assert agent._generate(client, "p", {}) == ([], agent.MODELS[1])
 
 
+def test_generate_retry_putaran_kalau_semua_model_overload():
+    # kasus 24 Nov 2026: semua model 503 -> dulu langsung gagal; sekarang tunggu lalu putaran berikutnya
+    calls, waits = [], []
+    def gen(model, **k):
+        calls.append(model)
+        if len(calls) <= len(agent.MODELS):  # seluruh putaran pertama gagal
+            raise agent.errors.ServerError(503, {"error": {"code": 503, "message": "x", "status": "UNAVAILABLE"}})
+        return type("R", (), {"text": "[]"})()
+    client = type("C", (), {"models": type("M", (), {"generate_content": staticmethod(gen)})()})()
+    assert agent._generate(client, "p", {}, rounds=2, wait_s=5, sleep=waits.append) == ([], agent.MODELS[0])
+    assert waits == [5] and calls == agent.MODELS + agent.MODELS[:1]
+
+    calls.clear(); waits.clear()  # putaran habis -> error asli tetap dilempar
+    def always_503(model, **k):
+        calls.append(model)
+        raise agent.errors.ServerError(503, {"error": {"code": 503, "message": "x", "status": "UNAVAILABLE"}})
+    client.models.generate_content = always_503
+    try:
+        agent._generate(client, "p", {}, rounds=2, wait_s=5, sleep=waits.append)
+        assert False, "harusnya error"
+    except agent.errors.ServerError:
+        pass
+    assert waits == [5] and len(calls) == 2 * len(agent.MODELS)
+
+
 def _idea(pillar, source_id, fmt="Feed", style="Perbandingan", hook=None, score=7):
     return {"pillar": pillar, "format": fmt, "hook_style": style, "hook": hook or f"hook {pillar} {source_id}",
-            "angle": "a", "outline": [{"title": "t", "copy": "c", "visual": "v"}],
-            "caption": "cap", "cta": "Save dulu", "hashtags": ["webdev", "#UIUX", "web dev", "#webdev"],
+            "angle": "a", "why_now": "baru rilis", "key_facts": ["Fakta 1", " ", "Fakta 2"],
             "score": score, "source_id": source_id}
 
 
@@ -115,13 +139,13 @@ def test_select_batasi_satu_domain_per_hari():
     assert [p["link"] for p in picks] == links[0:1] + links[2:4]  # smashing 1x, dev.to 2x
 
 
-def test_write_normalisasi_hashtag_dan_skor():
+def test_write_rapikan_fakta_dan_skor():
     agent.fetch_article = lambda url: ""
     picks = [{"title": "T", "link": "https://real.com/x", "published": "", "summary": "s",
               "pillar": "Tech & Tutorial"}]
     ideas, _ = agent.write(_FakeClient([_idea("Tech & Tutorial", 1, score=42)]),
                            picks, datetime.date(2026, 10, 20), [], [])
-    assert ideas[0]["hashtags"] == ["#webdev", "#UIUX"]
+    assert ideas[0]["key_facts"] == ["Fakta 1", "Fakta 2"]  # poin kosong dibuang
     assert ideas[0]["score"] == 10
 
 
@@ -134,14 +158,17 @@ def test_quality_warnings():
     assert any("porsi Reels" in x for x in w)   # 0% Reels
 
 
-def test_render_reels_naskah_per_scene_dan_history_tetap_kebaca():
+def test_render_brief_gpt_dan_history_tetap_kebaca():
     idea = _idea("Tech & Tutorial", 1, fmt="Reels", hook="Tool ini ubah Figma jadi React")
-    idea.update(source="https://real.com/x", hashtags=["#webdev"], outline=[
-        {"title": "Hook", "copy": "Lihat ini.", "on_screen": "Figma → React", "visual": "screen rec", "duration_s": 3},
-        {"title": "Demo", "copy": "Klik export.", "visual": "close-up", "duration_s": 10}])
+    idea.update(source="https://real.com/x", key_facts=["Export 1 komponen butuh 10 detik"])
     md = agent._render_markdown([idea])
-    assert "Prioritas hari ini" in md and "total ±13 detik" in md and "(3-13 dtk)" in md
-    assert "Teks layar: Figma → React" in md and "**Hashtag:** #webdev" in md
+    assert "Prioritas hari ini" in md and "**Kenapa sekarang:** baru rilis" in md
+    assert "**Fakta kunci:**\n- Export 1 komponen butuh 10 detik\n" in md
+    brief = agent.gpt_brief(idea)
+    assert "naskah Reels" in brief and "Hook: Tool ini ubah Figma jadi React" in brief
+    assert "- Export 1 komponen butuh 10 detik" in brief and "Sumber: https://real.com/x" in brief
+    assert f"```text\n{brief}\n```" in md
+    assert "copy carousel" in agent.gpt_brief({**idea, "format": "Feed", "source": "-"})
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, "2026-10-26.md"), "w", encoding="utf-8") as f:
             f.write(md)

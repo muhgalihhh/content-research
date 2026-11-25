@@ -2,8 +2,11 @@ name: daily-content-research
 
 on:
   schedule:
-    - cron: '0 23 * * *' # 06:00 WIB (Actions pakai UTC, WIB = UTC+7)
-  workflow_dispatch: # tombol trigger manual buat testing
+    # Actions pakai UTC (WIB = UTC+7). Menit ganjil sengaja: jadwal di menit :00 antreannya paling padat,
+    # dulu '0 23 * * *' (06:00 WIB) baru jalan jam 10:00-13:30 WIB.
+    - cron: '17 22 * * *' # utama: 05:17 WIB
+    - cron: '43 2 * * *'  # cadangan: 09:43 WIB, cuma jalan kalau riset hari ini belum ada (mis. utama gagal)
+  workflow_dispatch: # tombol trigger manual: selalu jalan (re-run hari yang sama boleh)
 
 concurrency:
   group: daily-content-research
@@ -12,7 +15,7 @@ concurrency:
 jobs:
   research:
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # normalnya < 5 menit; sisanya ruang buat timeout + fallback model Gemini
+    timeout-minutes: 30 # normalnya < 5 menit; sisanya ruang buat retry putaran Gemini kalau overload
     env:
       TZ: Asia/Jakarta # date.today() & `date +%F` ikut WIB, bukan UTC
       PYTHONUNBUFFERED: '1' # log print langsung muncul, nggak hilang kalau job di-kill
@@ -20,18 +23,29 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Cek riset hari ini sudah ada
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -f "research/$(date +%F).md" ]; then
+            echo "Riset $(date +%F) sudah ada, skip."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-python@v5
+        if: steps.check.outputs.skip != 'true'
         with:
           python-version: '3.12'
           cache: 'pip'
-      - run: pip install -r requirements.txt
+      - if: steps.check.outputs.skip != 'true'
+        run: pip install -r requirements.txt
       - name: Run agent
+        if: steps.check.outputs.skip != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python agent.py
       - name: Commit output
+        if: steps.check.outputs.skip != 'true'
         run: |
           git config user.name "content-bot"
           git config user.email "bot@xharp.dev"

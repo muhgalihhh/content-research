@@ -8,7 +8,11 @@ from sources import fetch_rss, fetch_github_trending, fetch_article, FEED_STATUS
 # "gemini-4-argon" lebih baru tapi butuh billing. Cek: https://ai.google.dev/gemini-api/docs/models
 MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
 RETRYABLE_CODES = {429, 500, 503, 504}
-REQUEST_TIMEOUT_S = 180  # tahap tulis (maks ~14 ide x 5-7 slide) normalnya < 2 menit
+REQUEST_TIMEOUT_S = 120  # tahap tulis (brief ~10-14 ide) normalnya < 1 menit
+# 503 "high demand" biasanya sementara (24 Nov 2026 semua model 503 -> riset hari itu hilang). Kalau semua
+# model gagal, tunggu lalu coba lagi semua model dari awal, sampai GENERATE_ROUNDS putaran.
+GENERATE_ROUNDS = 3
+ROUND_WAIT_S = 90
 # target jumlah ide per hari (min, max) per pillar bersumber; Tech & Tutorial pillar utama -> jatah terbanyak
 IDEAS_PER_PILLAR = {"Tech & Tutorial": (3, 5), "Design & UI/UX": (1, 3), "IT & Tech Industry": (1, 3)}
 HISTORY_DAYS = 7  # hook N hari terakhir dikirim ke Gemini supaya topiknya nggak diulang-ulang
@@ -83,8 +87,9 @@ HARI_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
 BULAN_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
             "Agustus", "September", "Oktober", "November", "Desember"]
 
-REQUIRED_FIELDS = ("pillar", "format", "hook_style", "hook", "angle", "outline",
-                   "caption", "cta", "hashtags", "score", "source_id")
+# Output = brief ide, bukan naskah. Naskah lengkap ditulis terpisah (GPT) dari blok "Brief buat GPT".
+REQUIRED_FIELDS = ("pillar", "format", "hook_style", "hook", "angle", "why_now", "key_facts",
+                   "score", "source_id")
 
 SELECT_SCHEMA = {
     "type": "array",
@@ -110,23 +115,8 @@ WRITE_SCHEMA = {
             "hook_style": {"type": "string", "enum": list(HOOK_STYLES.keys())},
             "hook": {"type": "string"},
             "angle": {"type": "string"},
-            "outline": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "copy": {"type": "string"},
-                        "on_screen": {"type": "string"},
-                        "visual": {"type": "string"},
-                        "duration_s": {"type": "integer"},
-                    },
-                    "required": ["title", "copy", "visual"],
-                },
-            },
-            "caption": {"type": "string"},
-            "cta": {"type": "string"},
-            "hashtags": {"type": "array", "items": {"type": "string"}},
+            "why_now": {"type": "string"},
+            "key_facts": {"type": "array", "items": {"type": "string"}},
             "score": {"type": "integer"},
             "source_id": {"type": "integer"},
         },
@@ -159,8 +149,11 @@ Satu sumber hanya boleh dipilih sekali. Isi "why" dengan 1 kalimat alasan memili
 Balas HANYA JSON array sesuai schema. Daftar sumber (pakai "id"-nya):
 {sources}"""
 
-WRITE_PROMPT = """Kamu content strategist + scriptwriter buat Instagram brand xharp.dev (software development &
-design studio). Audiens: developer, desainer, & orang yang tertarik dunia IT di Indonesia.
+WRITE_PROMPT = """Kamu content strategist Instagram brand xharp.dev (software development & design studio).
+Audiens: developer, desainer, & orang yang tertarik dunia IT di Indonesia.
+Tugasmu BUKAN nulis naskah, tapi bikin BRIEF IDE: hook, angle, & fakta kunci yang nanti dipakai penulis
+naskah lain (yang TIDAK membaca artikel sumbernya). Jadi fakta kunci harus lengkap & akurat.
+
 Dua format:
 - Reels: video vertikal 15-45 detik. Tujuannya jangkauan ke orang yang BELUM follow, jadi 3 detik pertama
   harus bikin berhenti scroll. Cocok buat demo, before/after, tips cepat, berita + dampaknya, opini.
@@ -179,15 +172,13 @@ ATURAN BIAR NGGAK BORING (wajib):
 - JANGAN buka hook dengan: {banned_openers}. Jangan pakai pertanyaan retoris "Pernah ...?" sama sekali.
 - Tiap ide pilih satu hook_style dari daftar ini, dan satu gaya maksimal {max_same_style}x hari ini:
 {hook_styles}
-- Copy padat & ngobrol, kayak dev ngomong ke temen. Satu slide/scene = satu poin. Tanpa basa-basi
-  ("Di era digital ini...", "Teknologi terus berkembang..."), tanpa kalimat penutup yang kosong.
-- Angle harus jawab "kenapa audiens peduli HARI INI", bukan ringkasan isi sumber.
-- Slide/scene terakhir bukan rangkuman, tapi payoff (hasil, takeaway yang bisa langsung dipraktekin) + CTA.
+- Bahasa ngobrol, kayak dev ngomong ke temen. Tanpa basa-basi ("Di era digital ini...").
+- Angle = sudut pandang yang bikin ide ini beda, bukan ringkasan isi sumber.
 
 Tugas kamu:
 1. Untuk TIAP sumber di daftar bawah, buat tepat 1 ide di pillar yang tertulis, isi source_id = id sumbernya.
-   Fakta, angka, nama fitur/produk, & klaim di copy WAJIB berasal dari "content" sumber itu. Kalau content-nya
-   tipis, bahas secara umum -- JANGAN ngarang detail spesifik yang nggak ada di content.
+   Fakta, angka, nama fitur/produk, & klaim WAJIB berasal dari "content" sumber itu. Kalau content-nya
+   tipis, tulis fakta yang ada saja (boleh cuma 1-2) -- JANGAN ngarang detail yang nggak ada di content.
 2. Buat 1 ide pillar Case Study & Portfolio, source_id = 0.
 {portfolio}
 3. Hari besar dalam 0-3 hari ke depan (hari & tanggal ini SUDAH PASTI benar -- pakai persis, jangan hitung
@@ -202,27 +193,43 @@ Untuk tiap ide, keluarkan field:
 - pillar: salah satu dari nama pillar di atas (persis sama penulisannya)
 - format: "Reels" atau "Feed"
 - hook_style: salah satu nama gaya hook di atas (persis)
-- hook: kalimat pembuka (Reels: yang diucapkan/ditulis di 3 detik pertama; Feed: judul slide pertama)
-- angle: kenapa ide ini menarik buat audiens sekarang (1-2 kalimat)
-- outline:
-  * Reels: 4-7 scene, total durasi 15-45 detik. Tiap scene: "title" (nama scene singkat), "copy" (narasi/
-    voiceover yang diucapkan, kalimat pendek), "on_screen" (teks overlay di layar, maks ~8 kata),
-    "visual" (apa yang tampil: screen recording apa, close-up kode/UI apa, before/after, talking head, dsb),
-    "duration_s" (detik). Scene pertama = hook, maks 3 detik.
-  * Feed: 5-8 slide. Tiap slide: "title" (judul slide), "copy" (isi slide SIAP PAKAI, 1-3 kalimat pendek),
-    "visual" (arahan desain: screenshot apa, ikon, diagram, perbandingan side-by-side, dsb). Kosongkan
-    on_screen & duration_s.
-- caption: caption Instagram siap posting, 2-4 kalimat. Kalimat pertama nge-hook (beda dari hook visual),
-  boleh 1-2 emoji, JANGAN ulang isi slide mentah-mentah.
-- cta: satu ajakan spesifik yang nyambung ke isi (mis. "Save buat dipake pas setup project berikutnya",
-  "Komen 'MAU' buat dapet template-nya", "Tag temen yang masih ..."), bukan "Follow untuk info lainnya".
-- hashtags: 5-8 hashtag relevan (campur niche & umum, boleh bahasa Indonesia), tanpa spasi.
+- hook: kalimat pembuka (Reels: 3 detik pertama; Feed: judul slide pertama)
+- angle: sudut pandang ide ini & apa yang audiens dapat (1-2 kalimat)
+- why_now: 1 kalimat kenapa relevan HARI INI (rilis baru, tren, kejadian minggu ini, hari besar)
+- key_facts: 3-5 poin fakta dari sumber yang dibutuhkan buat nulis naskah: angka, nama fitur/produk/tool,
+  langkah/cara pakai, perbandingan, kutipan klaim penting. Tiap poin 1 kalimat, berdiri sendiri, tanpa
+  opini. Case Study/Hari Besar: poin yang perlu diisi/disiapkan (placeholder [..] kalau datanya belum ada).
 - score: 1-10, potensi engagement di IG (seberapa bikin berhenti scroll + layak di-save/share). Jujur,
   jangan semua 8-9.
 - source_id: id sumber dari daftar di bawah, atau 0 untuk Case Study & Portfolio / Hari Besar
 
 Balas HANYA JSON array sesuai schema. Daftar sumber:
 {sources}"""
+
+# Blok siap tempel ke GPT buat nulis naskah lengkap. {format_task} beda per format.
+GPT_BRIEF = """Akun: Instagram @xharp.dev (software development & design studio)
+Audiens: developer, desainer, & orang yang tertarik dunia IT di Indonesia
+Gaya: bahasa Indonesia santai-profesional, kayak dev ngobrol ke temen, tanpa basa-basi
+
+Tugas: tulis {format_task}.
+
+Hook: {hook}
+Angle: {angle}
+Kenapa sekarang: {why_now}
+
+Fakta kunci (pakai HANYA fakta ini, jangan tambah klaim/angka lain):
+{facts}
+
+Sumber: {source}
+
+Sertakan juga: caption IG (2-4 kalimat), 1 CTA spesifik (bukan "follow untuk info lainnya"), & 5-8 hashtag."""
+
+GPT_FORMAT_TASK = {
+    "Reels": "naskah Reels 15-45 detik, per scene: durasi, voiceover, teks di layar, & arahan visual. "
+             "Scene pertama = hook (maks 3 detik), scene terakhir = payoff + CTA",
+    "Feed": "copy carousel Instagram 5-8 slide, per slide: judul, isi (1-3 kalimat pendek), & arahan visual. "
+            "Slide terakhir = takeaway + CTA",
+}
 
 PORTFOLIO_TEMPLATE_RULE = """   Belum ada data project asli -> buat sebagai TEMPLATE dengan placeholder eksplisit dalam kurung siku, misal
    "[NAMA PROJECT]" atau "[HASIL/ANGKA]". Hindari pembuka klise "Dari ide mentah jadi ..."; pakai angle
@@ -304,26 +311,32 @@ def get_client():
     ))
 
 
-def _generate(client, prompt, schema):
-    for model in MODELS:
-        started = time.monotonic()
-        try:
-            resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                ),
-            )
-            print(f"[agent] {model} selesai dalam {time.monotonic() - started:.0f} detik")
+def _generate(client, prompt, schema, rounds=GENERATE_ROUNDS, wait_s=ROUND_WAIT_S, sleep=time.sleep):
+    resp = None
+    for rnd in range(1, rounds + 1):
+        for model in MODELS:
+            started = time.monotonic()
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=schema,
+                    ),
+                )
+                print(f"[agent] {model} selesai dalam {time.monotonic() - started:.0f} detik")
+                break
+            except (errors.APIError, httpx.TimeoutException) as exc:  # timeout dilempar httpx, bukan APIError
+                retryable = isinstance(exc, httpx.TimeoutException) or exc.code in RETRYABLE_CODES
+                if not retryable or (model == MODELS[-1] and rnd == rounds):
+                    raise
+                print(f"[agent] {model} gagal setelah {time.monotonic() - started:.0f} detik "
+                      f"({type(exc).__name__}: {str(exc)[:80]}), fallback ke model berikutnya")
+        if resp is not None:
             break
-        except (errors.APIError, httpx.TimeoutException) as exc:  # timeout dilempar httpx, bukan APIError
-            retryable = isinstance(exc, httpx.TimeoutException) or exc.code in RETRYABLE_CODES
-            if not retryable or model == MODELS[-1]:
-                raise
-            print(f"[agent] {model} gagal setelah {time.monotonic() - started:.0f} detik "
-                  f"({type(exc).__name__}: {str(exc)[:80]}), fallback ke model berikutnya")
+        print(f"[agent] semua model gagal di putaran {rnd}/{rounds}, tunggu {wait_s} detik lalu coba lagi")
+        sleep(wait_s)
     try:
         data = json.loads(resp.text)
     except (json.JSONDecodeError, TypeError) as exc:
@@ -392,16 +405,10 @@ def _validate_idea(i, idea):
         raise RuntimeError(f"Ide #{i} pakai pillar tidak dikenal: {idea['pillar']!r}")
     if idea["format"] not in FORMATS:
         raise RuntimeError(f"Ide #{i} pakai format tidak dikenal: {idea['format']!r}")
-    if not isinstance(idea["outline"], list) or not idea["outline"]:
-        raise RuntimeError(f"Ide #{i} outline kosong/tidak valid: {idea!r}")
-    for slide in idea["outline"]:
-        if "title" not in slide or "copy" not in slide:
-            raise RuntimeError(f"Ide #{i} ada slide/scene tanpa title/copy: {slide!r}")
-    if not isinstance(idea["hashtags"], list):
-        idea["hashtags"] = []
-    # hashtag rapi: selalu diawali '#', tanpa spasi, tanpa dobel
-    idea["hashtags"] = list(dict.fromkeys(
-        "#" + re.sub(r"\s+", "", h).lstrip("#") for h in idea["hashtags"] if str(h).strip("# ")))
+    facts = idea["key_facts"] if isinstance(idea["key_facts"], list) else []
+    idea["key_facts"] = [str(f).strip() for f in facts if str(f).strip()]
+    if not idea["key_facts"] and idea["pillar"] not in PLACEHOLDER_PILLARS:
+        print(f"[agent] peringatan: ide #{i} tanpa fakta kunci, naskah GPT rawan ngarang ({idea['hook']!r})")
     idea["score"] = min(10, max(1, int(idea["score"]))) if isinstance(idea["score"], (int, float)) else 5
 
 
@@ -427,8 +434,8 @@ def _quality_warnings(ideas):
 
 
 def write(client, picks, today, recent_hooks, hari_besar, project=None):
-    """Tahap 2: tulis ide + copy berdasarkan isi artikel yang dipilih. Link sumber diisi kode dari
-    source_id, jadi Gemini nggak bisa ngarang URL."""
+    """Tahap 2: tulis brief ide (hook, angle, fakta kunci) berdasarkan isi artikel yang dipilih. Link sumber
+    diisi kode dari source_id, jadi Gemini nggak bisa ngarang URL."""
     sources = []
     for n, p in enumerate(picks, start=1):
         text = fetch_article(p["link"])
@@ -485,29 +492,15 @@ def write(client, picks, today, recent_hooks, hari_besar, project=None):
     return ideas, model
 
 
-def _render_outline(idea):
-    out = []
-    if idea["format"] == "Reels":
-        total = sum(int(s.get("duration_s") or 0) for s in idea["outline"])
-        out.append(f"**Naskah per scene** (total ±{total} detik):\n" if total else "**Naskah per scene:**\n")
-        t = 0
-        for n, s in enumerate(idea["outline"], start=1):
-            dur = int(s.get("duration_s") or 0)
-            timing = f" _({t}-{t + dur} dtk)_" if dur else ""
-            t += dur
-            out.append(f"{n}. **{s['title']}**{timing}\n")
-            out.append(f"   - 🎙️ VO: {s['copy']}\n")
-            if s.get("on_screen"):
-                out.append(f"   - 🔤 Teks layar: {s['on_screen']}\n")
-            if s.get("visual"):
-                out.append(f"   - 🎬 Visual: {s['visual']}\n")
-    else:
-        out.append("**Slide-by-slide:**\n")
-        for n, s in enumerate(idea["outline"], start=1):
-            out.append(f"{n}. **{s['title']}** — {s['copy']}\n")
-            if s.get("visual"):
-                out.append(f"   - 🎨 Visual: {s['visual']}\n")
-    return out
+def gpt_brief(idea):
+    """Teks siap tempel ke GPT buat nulis naskah lengkap dari brief ide ini."""
+    source = (idea.get("source") or "-").strip()
+    return GPT_BRIEF.format(
+        format_task=GPT_FORMAT_TASK[idea["format"]],
+        hook=idea["hook"], angle=idea["angle"], why_now=idea["why_now"],
+        facts="\n".join(f"- {f}" for f in idea["key_facts"]) or "- (tidak ada, isi manual)",
+        source=source if source != "-" else "internal xharp.dev",
+    )
 
 
 def _render_priorities(ideas, top=3):
@@ -538,16 +531,17 @@ def _render_markdown(ideas, project=None):
             parts.append(f"### {n}. {idea['hook']} _(Format: {fmt} — {FORMATS[fmt]})_\n\n")
             parts.append(f"**Gaya hook:** {idea['hook_style']} · **Skor:** {idea['score']}/10\n\n")
             parts.append(f"**Angle:** {idea['angle']}\n\n")
-            parts += _render_outline(idea)
-            parts.append(f"\n**Caption:** {idea['caption']}\n\n")
-            parts.append(f"**CTA:** {idea['cta']}\n\n")
-            if idea["hashtags"]:
-                parts.append(f"**Hashtag:** {' '.join(idea['hashtags'])}\n")
+            parts.append(f"**Kenapa sekarang:** {idea['why_now']}\n\n")
+            if idea["key_facts"]:
+                parts.append("**Fakta kunci:**\n" + "".join(f"- {f}\n" for f in idea["key_facts"]) + "\n")
             source = (idea.get("source") or "-").strip()
             if source and source != "-":
-                parts.append(f"\n[Sumber]({source})\n\n")
+                parts.append(f"[Sumber]({source})\n\n")
             else:
-                parts.append("\nSumber: - (internal)\n\n")
+                parts.append("Sumber: - (internal)\n\n")
+            # <details> + blok kode: di GitHub kelihatan rapi & ada tombol copy
+            parts.append("<details><summary>📋 Brief buat GPT (buka, lalu copy)</summary>\n\n"
+                         f"```text\n{gpt_brief(idea)}\n```\n\n</details>\n\n")
             parts.append("---\n\n")
     return "".join(parts)
 

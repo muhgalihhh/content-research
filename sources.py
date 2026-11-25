@@ -7,7 +7,6 @@ MAX_AGE_DAYS = 7  # item RSS lebih tua dari ini dibuang -- feed yang jarang upda
 RSS_FEEDS = [
     # agregator & komunitas dev (umum)
     "https://hnrss.org/frontpage?points=100",
-    "https://www.reddit.com/r/programming/.rss",
     "https://dev.to/feed",
     # tutorial & web dev (pillar: Tech & Tutorial)
     "https://css-tricks.com/feed/",
