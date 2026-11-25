@@ -1,0 +1,12 @@
+[
+  {
+    "name": "[NAMA PROJECT]",
+    "client_type": "[mis. UMKM kuliner, startup edtech, instansi]",
+    "problem": "[masalah klien sebelum ada project ini]",
+    "solution": "[apa yang xharp.dev bangun/desain]",
+    "stack": ["Laravel", "Next.js", "Figma"],
+    "highlights": ["[keputusan desain / tantangan teknis yang menarik]"],
+    "results": ["[hasil/angka nyata, kosongkan kalau belum ada]"],
+    "assets": "[link Figma / screenshot / demo yang bisa dipakai buat visual]"
+  }
+]

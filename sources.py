@@ -7,7 +7,6 @@ MAX_AGE_DAYS = 7  # item RSS lebih tua dari ini dibuang -- feed yang jarang upda
 RSS_FEEDS = [
     # agregator & komunitas dev (umum)
     "https://hnrss.org/frontpage?points=100",
-    "https://www.reddit.com/r/programming/.rss",
     "https://dev.to/feed",
     # tutorial & web dev (pillar: Tech & Tutorial)
     "https://css-tricks.com/feed/",
@@ -20,18 +19,36 @@ RSS_FEEDS = [
     "https://zapier.com/blog/feed/",
     "https://www.producthunt.com/feed",
     "https://simonwillison.net/atom/everything/",
+    # stack xharp sendiri: Python/FastAPI & Docker (pillar: Tech & Tutorial)
+    "https://realpython.com/atom.xml",
+    "https://github.com/fastapi/fastapi/releases.atom",
+    "https://www.docker.com/blog/feed/",
+    # rilis AI tools langsung dari sumber resmi -- bahan Reels "fitur baru, cobain ini"
+    "https://openai.com/news/rss.xml",
+    "https://blog.google/technology/ai/rss/",
     # design & UI/UX (pillar: Design & UI/UX)
     "https://www.smashingmagazine.com/feed/",
     "https://uxdesign.cc/feed",
     "https://sidebar.io/feed.xml",
+    # design yang visual / bisa didemoin -> cocok Reels (efek web, animasi, interaksi)
+    "https://tympanus.net/codrops/feed/",
+    # UX berbasis riset, lebih padat dari artikel opini
+    "https://www.nngroup.com/feed/rss/",
     # berita industri IT non-teknis (pillar: IT & Tech Industry)
     "https://www.zdnet.com/news/rss.xml",
     "https://techcrunch.com/feed/",
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-    # konteks Indonesia (pillar: IT & Tech Industry)
+    # konteks Indonesia (pillar: IT & Tech Industry). Google News linknya redirect via JS -> isi artikel
+    # nggak ke-fetch, jadi ditambah media lokal yang link-nya langsung ke artikel.
     "https://dailysocial.id/feed",
+    "https://www.cnnindonesia.com/teknologi/rss",
+    "https://rss.detik.com/index.php/inet",
     "https://news.google.com/rss/search?q=startup+teknologi+when:7d&hl=id&gl=ID&ceid=ID:id",
 ]
+
+# url feed -> status run terakhir ("ok: N item", "0 item fresh", "gagal: ..."), ditampilkan di step summary
+# Actions supaya feed yang mati / pindah alamat langsung kelihatan.
+FEED_STATUS = {}
 
 GITHUB_SEARCH_URL = "https://api.github.com/search/repositories"
 
@@ -55,9 +72,12 @@ def fetch_rss(limit_per_feed=8, timeout=15, max_age_days=MAX_AGE_DAYS):
             feed = feedparser.parse(resp.content)
         except Exception as exc:
             print(f"[sources] gagal fetch RSS {url}: {exc}")
+            FEED_STATUS[url] = f"gagal: {str(exc)[:80]}"
             continue
         # item tanpa tanggal ikut dibuang: nggak bisa dipastikan fresh
         fresh = [e for e in feed.entries if _entry_time(e) >= cutoff and e.get("link")]
+        FEED_STATUS[url] = f"ok: {len(fresh)} item fresh" if fresh else (
+            f"0 item fresh (total {len(feed.entries)} item di feed)")
         if not fresh:
             print(f"[sources] {url}: 0 item dalam {max_age_days} hari terakhir (feed jarang update?)")
         for e in fresh[:limit_per_feed]:
